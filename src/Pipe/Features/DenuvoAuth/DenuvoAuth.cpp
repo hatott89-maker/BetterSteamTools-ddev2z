@@ -121,6 +121,33 @@ namespace {
                 return;
             }
 
+            // 保护机制：如果凭证库中已存在有效的 AppOwnershipTicket，
+            // 其内嵌的 SteamID 才是 Denuvo 离线 Token 绑定的唯一合法所有者。
+            // 绝不能用 Steam 当前活跃用户（通常是切回的玩家个人账号）盲目覆写，否则会导致离线 Token 失效报错！
+            const auto existingTicket = AppTicket::GetAppOwnershipTicketFromCredentialStore(authorizedAppId);
+            if (!existingTicket.empty()) {
+                const uint64_t ticketSteamId = AppTicket::ExtractSteamIdFromTicketBytes(existingTicket);
+                if (ticketSteamId != 0) {
+                    LOG_PIPE_INFO("DenuvoAuth: end authorization preserving ticket SteamID auth_appid={} steamid={}",
+                                  authorizedAppId, ticketSteamId);
+                    uint64_t regSteamId = 0;
+                    if (OSTPlatform::SteamCredentialStore::GetSteamId(authorizedAppId, regSteamId) !=
+                            OSTPlatform::SteamCredentialStore::Status::Ok || regSteamId == 0) {
+                        AppTicket::WriteSteamID(authorizedAppId, ticketSteamId);
+                    }
+                    return;
+                }
+            }
+
+            // 如果注册表中已存在有效的 SteamID，同样保留，严禁覆写
+            uint64_t existingSteamId = 0;
+            if (OSTPlatform::SteamCredentialStore::GetSteamId(authorizedAppId, existingSteamId) ==
+                    OSTPlatform::SteamCredentialStore::Status::Ok && existingSteamId != 0) {
+                LOG_PIPE_INFO("DenuvoAuth: end authorization preserving existing registry SteamID auth_appid={} steamid={}",
+                              authorizedAppId, existingSteamId);
+                return;
+            }
+
             const std::optional<uint64> steamId = GetCurrentSteamIdForDenuvoAuth();
             if (!steamId || *steamId == 0) {
                 LOG_PIPE_WARN("DenuvoAuth: end authorization no current SteamID source auth_appid={}",
