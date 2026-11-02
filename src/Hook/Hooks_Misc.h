@@ -16,6 +16,10 @@ namespace Hooks_Misc {
     // GetAppIDForCurrentPipe.
     AppId_t GetAppIDForCurrentPipeWrap();
 
+    // Dynamically override AppId for ticket extraction / special operations
+    void SetOverrideAppId(AppId_t appId);
+    AppId_t GetOverrideAppId();
+
     // True while a -onlinefix game is the active spawn.
     bool IsOnlineFixActive();
 

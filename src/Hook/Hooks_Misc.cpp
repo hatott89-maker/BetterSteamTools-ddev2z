@@ -7,9 +7,32 @@ namespace {
     // ── Resolve-only functions ─────────────────────────────────────
     RESOLVE_FUNC(CUtlBufferEnsureCapacity, void*, CUtlBuffer* pCUtlBuffer, uint32 newCapacity);
 
+    static std::atomic<AppId_t> g_OverrideAppId{0};
+    void* g_steamEngine = nullptr;
+
+    using GetAppIDForPipe_t = AppId_t(__fastcall*)(void*, int32);
+    inline GetAppIDForPipe_t oGetAppIDForPipe = nullptr;
+
+    AppId_t __fastcall hkGetAppIDForPipe(void* pSteamEngine, int32 pipe) {
+        g_steamEngine = pSteamEngine;
+        AppId_t overrideId = g_OverrideAppId.load(std::memory_order_relaxed);
+        if (overrideId != 0) {
+            return overrideId;
+        }
+        return oGetAppIDForPipe(pSteamEngine, pipe);
+    }
+
+    HOOK_FUNC(GetAppIDForCurrentPipe, AppId_t, void* pSteamEngine) {
+        g_steamEngine = pSteamEngine;
+        AppId_t overrideId = g_OverrideAppId.load(std::memory_order_relaxed);
+        if (overrideId != 0) {
+            return overrideId;
+        }
+        return oGetAppIDForCurrentPipe(pSteamEngine);
+    }
+
     // ── VEH-captured functions (one-shot int3) ───────────────────────────────
     // On int3 hit, ctx->Rcx is stored to the named output variable.
-    CAPTURE_THIS_FUNC(GetAppIDForCurrentPipe, AppId_t,      g_steamEngine,    void*);
     CAPTURE_THIS_FUNC(GetAppDataFromAppInfo,  int64,        g_pCAppInfoCache, void*, AppId_t, const char*, uint8*, int32);
 
     // Assumes one game at a time.  Set by SpawnProcess VEH when -onlinefix
@@ -112,20 +135,33 @@ namespace Hooks_Misc {
     void Install() {
         RESOLVE_C(CUtlBufferEnsureCapacity);
 
-        ARM_CAPTURE_C(GetAppIDForCurrentPipe);
         ARM_CAPTURE_C(GetAppDataFromAppInfo);
-
         ARM_INT3_C(SpawnProcess, true, &OnSpawnProcessHit, nullptr);
 
         HOOK_BEGIN();
+        INSTALL_HOOK_C(GetAppIDForCurrentPipe);
         INSTALL_HOOK_C(BuildSpawnEnvBlock);
         INSTALL_HOOK_C(OptedInMask);
         // INSTALL_HOOK_C(GetOrAddAppData);
         HOOK_END();
+
+        if (oGetAppIDForCurrentPipe) {
+            auto* pPipeFunc = reinterpret_cast<uint8_t*>(oGetAppIDForCurrentPipe) + 0x70;
+            if (pPipeFunc[0] == 0x8B && pPipeFunc[1] == 0x81 && pPipeFunc[2] == 0xD0 && pPipeFunc[3] == 0x10) {
+                oGetAppIDForPipe = reinterpret_cast<GetAppIDForPipe_t>(pPipeFunc);
+                OSTPlatform::Detour::Attach(reinterpret_cast<void**>(&oGetAppIDForPipe), reinterpret_cast<void*>(hkGetAppIDForPipe));
+            }
+        }
     }
 
     void Uninstall() {
+        if (oGetAppIDForPipe) {
+            OSTPlatform::Detour::Detach(reinterpret_cast<void**>(&oGetAppIDForPipe), reinterpret_cast<void*>(hkGetAppIDForPipe));
+            oGetAppIDForPipe = nullptr;
+        }
+
         UNHOOK_BEGIN();
+        UNINSTALL_HOOK(GetAppIDForCurrentPipe);
         UNINSTALL_HOOK(BuildSpawnEnvBlock);
         UNINSTALL_HOOK(OptedInMask);
         // UNINSTALL_HOOK(GetOrAddAppData);
@@ -133,7 +169,9 @@ namespace Hooks_Misc {
     }
 
     AppId_t GetAppIDForCurrentPipeWrap() {
-        if (!CAPTURE_READY(GetAppIDForCurrentPipe)) {
+        AppId_t overrideId = g_OverrideAppId.load(std::memory_order_relaxed);
+        if (overrideId != 0) return overrideId;
+        if (!oGetAppIDForCurrentPipe || !g_steamEngine) {
             LOG_MISC_WARN("GetAppIDForCurrentPipeWrap called before capture — returning 0");
             return 0;
         }
@@ -146,10 +184,19 @@ namespace Hooks_Misc {
         return appid;
     }
 
-    
     AppId_t ResolveAppId() {
+        AppId_t overrideId = g_OverrideAppId.load(std::memory_order_relaxed);
+        if (overrideId != 0) return overrideId;
         if (g_OnlineFixRealAppId) return g_OnlineFixRealAppId;
         return GetAppIDForCurrentPipeWrap();
+    }
+
+    void SetOverrideAppId(AppId_t appId) {
+        g_OverrideAppId.store(appId, std::memory_order_relaxed);
+    }
+
+    AppId_t GetOverrideAppId() {
+        return g_OverrideAppId.load(std::memory_order_relaxed);
     }
 
     bool IsOnlineFixActive() {

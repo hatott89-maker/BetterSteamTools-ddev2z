@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <cstdint>
+#include <charconv>
 #include <fstream>
 #include <iostream>
 #include <optional>
@@ -111,10 +112,6 @@ HMODULE LoadSteamClient64(std::string& loadedPath) {
     const std::string steamDir{NormalizeDir(*steamPath)};
     loadedPath = JoinPath(*steamPath, "steamclient64.dll");
 
-    // steamclient64.dll pulls in tier0_s64.dll / vstdlib_s64.dll from the Steam
-    // directory. Add that directory to the search path and load with
-    // LOAD_WITH_ALTERED_SEARCH_PATH so those dependencies resolve; otherwise the
-    // load fails with ERROR_MOD_NOT_FOUND (126).
     SetDllDirectoryA(steamDir.c_str());
     HMODULE module{LoadLibraryExA(loadedPath.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)};
     if (!module) {
@@ -142,7 +139,6 @@ ISteamClient* CreateSteamClient(HMODULE module) {
     return client;
 }
 
-// Open a pipe and attach to the already-running global user
 bool OpenSession(ISteamClient* client, HSteamPipe& pipe, HSteamUser& user) {
     pipe = client->CreateSteamPipe();
     if (!pipe) {
@@ -161,8 +157,6 @@ bool OpenSession(ISteamClient* client, HSteamPipe& pipe, HSteamUser& user) {
     return true;
 }
 
-// App ownership ticket: ISteamAppTicket hands back the raw signed buffer plus
-// offsets into it. nAppID is explicit, so this works for any owned app.
 std::optional<std::vector<uint8_t>> ExtractAppOwnershipTicket(
     ISteamClient* client, HSteamPipe pipe, HSteamUser user, uint32_t appId) {
     auto* appTicket{reinterpret_cast<ISteamAppTicket*>(
@@ -173,7 +167,7 @@ std::optional<std::vector<uint8_t>> ExtractAppOwnershipTicket(
         return std::nullopt;
     }
 
-    std::vector<uint8_t> buffer(2048);
+    std::vector<uint8_t> buffer(4096);
     uint32_t appIdOffset{0};
     uint32_t steamIdOffset{0};
     uint32_t signatureOffset{0};
@@ -202,10 +196,6 @@ std::optional<std::vector<uint8_t>> ExtractAppOwnershipTicket(
     return buffer;
 }
 
-// Encrypted app ticket: asynchronous request whose result arrives as
-// EncryptedAppTicketResponse_t. We have no callback dispatcher, so we poll
-// ISteamUtils::IsAPICallCompleted and then read the result + ticket.
-// See https://partner.steamgames.com/doc/api/ISteamUser#RequestEncryptedAppTicket
 std::optional<std::vector<uint8_t>> ExtractEncryptedAppTicket(
     ISteamClient* client, HSteamPipe pipe, HSteamUser user, uint32_t appId) {
     auto* utils{client->GetISteamUtils(pipe, kSteamUtilsInterfaceVersion)};
@@ -221,7 +211,6 @@ std::optional<std::vector<uint8_t>> ExtractEncryptedAppTicket(
         return std::nullopt;
     }
 
-    // Bounded poll so a wedged client can never hang the tool.
     constexpr int kMaxWaitMs{15000};
     constexpr int kStepMs{50};
     bool failed{false};
@@ -252,45 +241,40 @@ std::optional<std::vector<uint8_t>> ExtractEncryptedAppTicket(
         return std::nullopt;
     }
 
-    // Pass a null buffer first to learn the size, then fetch.
-    uint32_t cbTicket{0};
-    steamUser->GetEncryptedAppTicket(nullptr, 0, &cbTicket);
-    if (cbTicket == 0) {
-        std::cerr << "Encrypted app ticket is empty.\n";
+    std::vector<uint8_t> buffer(4096);
+    uint32_t bytesWritten{0};
+    if (!steamUser->GetEncryptedAppTicket(
+            buffer.data(), static_cast<int>(buffer.size()), &bytesWritten)
+        || bytesWritten == 0) {
+        std::cerr << "GetEncryptedAppTicket returned false or zero bytes.\n";
         return std::nullopt;
     }
 
-    std::vector<uint8_t> buffer(cbTicket);
-    if (!steamUser->GetEncryptedAppTicket(buffer.data(), static_cast<int>(buffer.size()), &cbTicket)) {
-        std::cerr << "GetEncryptedAppTicket failed.\n";
-        return std::nullopt;
-    }
-
-    buffer.resize(cbTicket);
-    std::cout << "Encrypted ticket " << cbTicket << " bytes\n";
+    buffer.resize(bytesWritten);
+    std::cout << "Encrypted ticket " << bytesWritten << " bytes\n";
     return buffer;
 }
 
-// Dump the raw ticket bytes as a classic hex view: offset, 16 hex bytes, ASCII.
-void PrintHex(const char* label, const std::vector<uint8_t>& data) {
+void PrintHex(std::string_view label, const std::vector<uint8_t>& data) {
+    static const char kHex[]{"0123456789abcdef"};
     std::cout << label << " (" << data.size() << " bytes):\n";
 
-    constexpr size_t kBytesPerRow{16};
-    static const char kHex[]{"0123456789abcdef"};
-
-    for (size_t row{0}; row < data.size(); row += kBytesPerRow) {
-        // Offset column.
+    for (size_t offset = 0; offset < data.size(); offset += 16) {
         std::string line;
-        for (int shift{12}; shift >= 0; shift -= 4) {
-            line += kHex[(row >> shift) & 0xF];
+        line.reserve(80);
+
+        for (int shift = 28; shift >= 0; shift -= 4) {
+            line += kHex[(offset >> shift) & 0xF];
         }
         line += "  ";
 
-        // Hex column.
         std::string ascii;
-        for (size_t col{0}; col < kBytesPerRow; ++col) {
-            if (row + col < data.size()) {
-                const uint8_t byte{data[row + col]};
+        ascii.reserve(16);
+
+        for (size_t col = 0; col < 16; ++col) {
+            const size_t index = offset + col;
+            if (index < data.size()) {
+                const uint8_t byte = data[index];
                 line += kHex[byte >> 4];
                 line += kHex[byte & 0xF];
                 line += ' ';
@@ -316,6 +300,25 @@ std::string ToHexString(const std::vector<uint8_t>& data) {
     return out;
 }
 
+std::vector<uint8_t> HexToBytes(std::string_view hex) {
+    std::vector<uint8_t> bytes;
+    if (hex.size() % 2 != 0) return bytes;
+    bytes.reserve(hex.size() / 2);
+    auto hexVal = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        int hi = hexVal(hex[i]);
+        int lo = hexVal(hex[i + 1]);
+        if (hi < 0 || lo < 0) return {};
+        bytes.push_back(static_cast<uint8_t>((hi << 4) | lo));
+    }
+    return bytes;
+}
+
 bool WriteBinaryFile(const std::string& path, const std::vector<uint8_t>& data) {
     std::ofstream output{path, std::ios::binary | std::ios::trunc};
     if (!output) {
@@ -331,16 +334,12 @@ bool WriteBinaryFile(const std::string& path, const std::vector<uint8_t>& data) 
     return true;
 }
 
-// Build the plain-text summary line for one ticket. Present -> the hex string,
-// absent -> "null".
 std::string TicketLine(const char* name, const std::optional<std::vector<uint8_t>>& ticket) {
     if (!ticket) return std::string{name} + ":null\n";
     return std::string{name} + "(" + std::to_string(ticket->size()) + "bytes):"
            + ToHexString(*ticket) + "\n";
 }
 
-// Everything lands in a single <appid> folder: the raw binary tickets
-// (only when present) plus a plain-text summary file.
 bool WriteOutputs(uint32_t appId,
                   const std::optional<std::vector<uint8_t>>& ownership,
                   const std::optional<std::vector<uint8_t>>& encrypted) {
@@ -367,11 +366,126 @@ bool WriteOutputs(uint32_t appId,
         return false;
     }
 
-    std::cout << "Wrote " << dir << "\\\n";
+    std::cout << "Successfully saved to directory: " << dir << "\\\n";
     return ok;
 }
 
-void WaitForExit() {
+// ── JSON Helpers for IPC Communication ─────────────────────────
+size_t FindValueStart(std::string_view body, std::string_view key) {
+    std::string needle = "\"" + std::string(key) + "\"";
+    size_t k = body.find(needle);
+    if (k == std::string_view::npos) return std::string_view::npos;
+    size_t colon = body.find(':', k + needle.size());
+    if (colon == std::string_view::npos) return std::string_view::npos;
+    size_t v = colon + 1;
+    while (v < body.size() && isspace(static_cast<unsigned char>(body[v]))) {
+        v++;
+    }
+    return v < body.size() ? v : std::string_view::npos;
+}
+
+bool JsonExtractString(std::string_view body, std::string_view key, std::string& out) {
+    size_t v = FindValueStart(body, key);
+    if (v == std::string_view::npos || body[v] != '"') return false;
+    size_t q1 = v;
+    size_t q2 = body.find('"', q1 + 1);
+    if (q2 == std::string_view::npos) return false;
+    out = std::string(body.substr(q1 + 1, q2 - q1 - 1));
+    return true;
+}
+
+bool JsonExtractUInt64(std::string_view body, std::string_view key, uint64_t& out) {
+    size_t v = FindValueStart(body, key);
+    if (v == std::string_view::npos) return false;
+    if (body[v] == '"') {
+        size_t q2 = body.find('"', v + 1);
+        if (q2 == std::string_view::npos) return false;
+        std::string_view numStr = body.substr(v + 1, q2 - v - 1);
+        auto [p, ec] = std::from_chars(numStr.data(), numStr.data() + numStr.size(), out);
+        return (ec == std::errc{});
+    }
+    if (isdigit(static_cast<unsigned char>(body[v]))) {
+        size_t end = v;
+        while (end < body.size() && isdigit(static_cast<unsigned char>(body[end]))) {
+            end++;
+        }
+        std::string_view numStr = body.substr(v, end - v);
+        auto [p, ec] = std::from_chars(numStr.data(), numStr.data() + numStr.size(), out);
+        return (ec == std::errc{});
+    }
+    return false;
+}
+
+bool TryExtractViaOpenSteamToolIpc(uint32_t appId) {
+    constexpr const char* kPipeName = "\\\\.\\pipe\\OpenSteamTool_IPC";
+    const std::string req = "{\"action\":\"extract_tickets\",\"appId\":" + std::to_string(appId) + "}";
+
+    std::vector<char> respBuf(131072, 0);
+    DWORD bytesRead = 0;
+
+    bool connected = false;
+    for (int retry = 0; retry < 10; ++retry) {
+        if (CallNamedPipeA(kPipeName, const_cast<char*>(req.data()), static_cast<DWORD>(req.size()),
+                            respBuf.data(), static_cast<DWORD>(respBuf.size()) - 1, &bytesRead, 5000)) {
+            connected = true;
+            break;
+        }
+        if (GetLastError() == ERROR_FILE_NOT_FOUND) {
+            Sleep(500);
+            continue;
+        }
+        break;
+    }
+
+    if (!connected) {
+        return false;
+    }
+
+    std::string resp(respBuf.data(), bytesRead);
+    std::cout << "[IPC] Connected to OpenSteamTool_IPC (steamcmd/steam host process)\n";
+
+    uint64_t code = 0;
+    if (!JsonExtractUInt64(resp, "code", code) || code != 200) {
+        std::string msg = "Unknown error";
+        JsonExtractString(resp, "message", msg);
+        std::cerr << "[IPC] Request failed: " << msg << "\n";
+        return true;
+    }
+
+    std::string ownershipHex, encryptedHex, debugInfo;
+    JsonExtractString(resp, "ownership", ownershipHex);
+    JsonExtractString(resp, "encrypted", encryptedHex);
+    JsonExtractString(resp, "debug", debugInfo);
+
+    std::optional<std::vector<uint8_t>> ownership;
+    std::optional<std::vector<uint8_t>> encrypted;
+
+    if (!ownershipHex.empty()) {
+        auto b = HexToBytes(ownershipHex);
+        if (!b.empty()) {
+            ownership = std::move(b);
+            PrintHex("Ownership ticket", *ownership);
+        }
+    } else {
+        std::cout << "[IPC] Ownership ticket not available yet (" << debugInfo << ")\n";
+    }
+
+    if (!encryptedHex.empty()) {
+        auto b = HexToBytes(encryptedHex);
+        if (!b.empty()) {
+            encrypted = std::move(b);
+            PrintHex("Encrypted ticket", *encrypted);
+        }
+    } else {
+        std::cout << "[IPC] Encrypted ticket not obtained (" << debugInfo << ")\n";
+    }
+
+    WriteOutputs(appId, ownership, encrypted);
+    return true;
+}
+
+void WaitForExit(bool wait) {
+    if (!wait) return;
     std::cout << "\nPress Enter to exit...";
     std::string dummy;
     std::getline(std::cin, dummy);
@@ -394,8 +508,14 @@ int Run(int argc, char** argv) {
         }
     }
 
-    // Run in the target app's context so GetAppID and RequestEncryptedAppTicket
-    // resolve to this AppID. Must be set before steamclient64.dll initializes.
+    // 1. Try extracting via OpenSteamTool_IPC (supports steamcmd and hooked Steam)
+    if (TryExtractViaOpenSteamToolIpc(*appId)) {
+        return 0;
+    }
+
+    std::cout << "OpenSteamTool_IPC not found. Falling back to native Steam client connection...\n";
+
+    // 2. Fallback to native Steam client connection
     const std::string appIdStr{std::to_string(*appId)};
     SetEnvironmentVariableA("SteamAppId", appIdStr.c_str());
     SetEnvironmentVariableA("SteamGameId", appIdStr.c_str());
@@ -443,11 +563,11 @@ int Run(int argc, char** argv) {
 int main(int argc, char** argv) {
 #if !defined(_WIN64)
     std::cerr << "extract_tickets must be built as a 64-bit Windows executable.\n";
-    WaitForExit();
+    WaitForExit(argc < 2);
     return 1;
 #else
     const int rc{Run(argc, argv)};
-    WaitForExit();
+    WaitForExit(argc < 2);
     return rc;
 #endif
 }

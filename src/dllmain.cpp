@@ -9,6 +9,7 @@
 #include "Utils/SteamMetadata/PatternLoader.h"
 #include "Utils/SteamMetadata/SteamDiagnostics.h"
 #include "Utils/Tokeer/TokeerBridge.h"
+#include "Utils/AppMetadata/AppMetadataIpcServer.h"
 #ifdef OST_ENABLE_UPDATER
 #include "Utils/Update/AppUpdater.h"
 #endif
@@ -42,9 +43,10 @@ bool InitializeSteamComponents()
     LOG_INFO("Loaded steamclient64.dll from {}", SteamclientPath);
     
     ui_hModule = OSTPlatform::DynamicLibrary::Load(SteamUIPath);
-    if(!ui_hModule) {
-        LOG_ERROR("Load failed for steamui.dll: err={}", OSTPlatform::DynamicLibrary::GetLastErrorCode());
-        return false;
+    if (!ui_hModule) {
+        LOG_WARN("Load failed for steamui.dll (optional for steamcmd): err={}", OSTPlatform::DynamicLibrary::GetLastErrorCode());
+    } else {
+        LOG_INFO("Loaded steamui.dll from {}", SteamUIPath);
     }
     return true;
 }
@@ -70,7 +72,9 @@ static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
     // Each call computes the SHA-256 of the DLL on disk, checks the local
     // cache, and downloads from GitHub if needed.  Both calls are synchronous
     // but run on this worker thread, never under the loader lock.
-    PatternLoader::Load(ui_hModule, SteamUIPath, "steamui");
+    if (ui_hModule) {
+        PatternLoader::Load(ui_hModule, SteamUIPath, "steamui");
+    }
     PatternLoader::Load(client_hModule, SteamclientPath, "steamclient");
 
     // IPC method metadata (funcHash, fencepost, argc, ...)
@@ -84,7 +88,9 @@ static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
     LuaFileWatcher::Start(watchDirs);
     ConfigFileWatcher::Start(ConfigPath, LuaDir);
 
-    SteamUI::CoreHook();
+    if (ui_hModule) {
+        SteamUI::CoreHook();
+    }
     SteamClient::CoreHook();
 
     // Surface any functions that FindPattern() could not locate.
@@ -132,21 +138,21 @@ static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
     LOG_INFO("Self-updater not compiled in (OST_ENABLE_UPDATER=OFF)");
 #endif
 
+    // Start IPC Named Pipe server for querying DLC and Depot Manifests
+    AppMetadataIpcServer::Start();
+
     LOG_INFO("OpenSteamTool init complete");
     return 0;
 }
 
-// True only when the host process is steam.exe. The proxy DLLs already gate injection to
-// Steam, but rundll32 loads this DLL directly to service a bst:// link — there we must NOT
-// run the Steam-injection machinery (steamclient load, hooks, watchers); the TokeerUri
-// export does its work standalone.
+// True only when the host process is steam.exe or steamcmd.exe.
 static bool IsSteamHost()
 {
     char exePath[MAX_PATH];
     if (!GetModuleFileNameA(nullptr, exePath, MAX_PATH)) return false;
     const char* name = strrchr(exePath, '\\');
     name = name ? name + 1 : exePath;
-    return _stricmp(name, "steam.exe") == 0;
+    return (_stricmp(name, "steam.exe") == 0 || _stricmp(name, "steamcmd.exe") == 0);
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)
@@ -164,11 +170,20 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)
     }
     else if (dwReason == DLL_PROCESS_DETACH && IsSteamHost())
     {
-        ConfigFileWatcher::Stop();
-        LuaFileWatcher::Stop();
-        SteamUI::CoreUnhook();
-        SteamClient::CoreUnhook();
-        CloudRedirectHost::Shutdown();
+        // If pvReserved != nullptr, the process is terminating (ExitProcess).
+        // Under Windows Loader Lock, waiting on worker threads or IPC during process termination
+        // causes deadlocks / zombie processes. Teardown is only needed when dynamically unloaded via FreeLibrary.
+        if (pvReserved == nullptr)
+        {
+            AppMetadataIpcServer::Stop();
+            ConfigFileWatcher::Stop();
+            LuaFileWatcher::Stop();
+            if (ui_hModule) {
+                SteamUI::CoreUnhook();
+            }
+            SteamClient::CoreUnhook();
+            CloudRedirectHost::Shutdown();
+        }
     }
 
     return TRUE;
