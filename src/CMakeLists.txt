@@ -232,3 +232,11 @@ add_library(xinput1_4 SHARED
     xinput1_4/xinput1_4.cpp
     xinput1_4/xinput1_4.def
 )
+
+# ---------------------------------------------------------------------------
+# version.dll hijack — alternative loader DLL placed alongside Steam.
+# ---------------------------------------------------------------------------
+add_library(version SHARED
+    version/version.cpp
+    version/version.def
+)
