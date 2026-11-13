@@ -176,13 +176,13 @@ target_link_libraries(OpenSteamTool PRIVATE
     $<$<CONFIG:Debug>:libprotobuf>
     $<$<CONFIG:Release>:libprotobuf-lite>
     tomlplusplus::tomlplusplus
-    $<$<CONFIG:Debug>:spdlog::spdlog>
+    spdlog::spdlog
     Shell32
 )
 
-# Logging is compiled in only for Debug; Release reduces LOG_* to no-ops.
+# Logging enabled across configurations so opensteamtool/main.log is created in Release as well
 target_compile_definitions(OpenSteamTool PRIVATE
-    $<$<CONFIG:Debug>:OPENSTEAMTOOL_LOGGING_ENABLED>
+    OPENSTEAMTOOL_LOGGING_ENABLED
 )
 
 # Backend endpoint for on-demand eticket minting (strict Denuvo titles that bind
@@ -210,7 +210,7 @@ endif()
 # This is a compile-time cut, not a runtime setting: with it off, the updater is
 # not reachable at all and [update] enabled in opensteamtool.toml has no effect.
 # Use it for private or pinned builds that must not be replaced under the user.
-option(OST_ENABLE_UPDATER "Compile in the self-updater" ON)
+option(OST_ENABLE_UPDATER "Compile in the self-updater" OFF)
 if(OST_ENABLE_UPDATER)
     target_compile_definitions(OpenSteamTool PRIVATE OST_ENABLE_UPDATER)
 endif()

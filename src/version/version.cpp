@@ -69,7 +69,7 @@ static void LoadRealVersion() {
     }
 }
 
-static BOOL OpenSteamToolLoad() {
+static BOOL OpenSteamToolLoad(HMODULE hModule) {
     char exePath[MAX_PATH];
     if (GetModuleFileNameA(NULL, exePath, MAX_PATH)) {
         const char* exeName = strrchr(exePath, '\\');
@@ -78,7 +78,23 @@ static BOOL OpenSteamToolLoad() {
             return TRUE;
         }
     }
-    return LoadLibraryA("OpenSteamTool.dll") != NULL;
+
+    // Prefer loading OpenSteamTool.dll from the same directory as this version.dll proxy
+    char dllDir[MAX_PATH];
+    if (GetModuleFileNameA(hModule, dllDir, MAX_PATH)) {
+        char* lastSlash = strrchr(dllDir, '\\');
+        if (lastSlash) {
+            *(lastSlash + 1) = '\0';
+            std::string fullPath = std::string(dllDir) + "OpenSteamTool.dll";
+            HMODULE hMod = LoadLibraryA(fullPath.c_str());
+            if (hMod) return TRUE;
+        }
+    }
+
+    // Fallback to standard DLL search paths
+    LoadLibraryA("OpenSteamTool.dll");
+    // Always return TRUE to prevent aborting host process initialization (error 0xC0000142)
+    return TRUE;
 }
 
 extern "C" {
@@ -156,8 +172,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved) {
     if (dwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         LoadRealVersion();
-        if (!OpenSteamToolLoad())
-            return FALSE;
+        OpenSteamToolLoad(hModule);
     }
     return TRUE;
 }
