@@ -6,6 +6,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 set(OPENSTEAMTOOL_VERSION "${PROJECT_VERSION}" CACHE STRING "Version string embedded into OpenSteamTool.dll")
 
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 # Allow CMAKE_MSVC_RUNTIME_LIBRARY to control runtime selection for all targets,
 # including dependencies pulled in via FetchContent.
 if(POLICY CMP0091)
