@@ -335,9 +335,8 @@ bool WriteBinaryFile(const std::string& path, const std::vector<uint8_t>& data) 
 }
 
 std::string TicketLine(const char* name, const std::optional<std::vector<uint8_t>>& ticket) {
-    if (!ticket) return std::string{name} + ":null\n";
-    return std::string{name} + "(" + std::to_string(ticket->size()) + "bytes):"
-           + ToHexString(*ticket) + "\n";
+    if (!ticket) return std::string{name} + ":\n";
+    return std::string{name} + ":" + ToHexString(*ticket) + "\n";
 }
 
 bool WriteOutputs(uint32_t appId,
@@ -349,10 +348,6 @@ bool WriteOutputs(uint32_t appId,
                   << " (GetLastError=" << GetLastError() << ").\n";
         return false;
     }
-
-    bool ok{true};
-    if (ownership) ok = WriteBinaryFile(JoinPath(dir, "appticket.bin"), *ownership) && ok;
-    if (encrypted) ok = WriteBinaryFile(JoinPath(dir, "eticket.bin"), *encrypted) && ok;
 
     const std::string text{
         "appid:" + std::to_string(appId) + "\n"
@@ -367,7 +362,7 @@ bool WriteOutputs(uint32_t appId,
     }
 
     std::cout << "Successfully saved to directory: " << dir << "\\\n";
-    return ok;
+    return true;
 }
 
 // ── JSON Helpers for IPC Communication ─────────────────────────
